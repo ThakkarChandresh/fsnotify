@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify/internal"
+	"github.com/fsnotify/fsnotify/internal/ztest"
 )
 
 // We wait a little bit after most commands; gives the system some time to sync
@@ -218,7 +219,7 @@ func mknod(t *testing.T, dev int, path ...string) {
 	}
 }
 
-// echoAppend and echoTrunc
+// echo > and echo >>
 func echoAppend(t *testing.T, data string, path ...string) { t.Helper(); echo(t, false, data, path...) }
 func echoTrunc(t *testing.T, data string, path ...string)  { t.Helper(); echo(t, true, data, path...) }
 func echo(t *testing.T, trunc bool, data string, path ...string) {
@@ -325,6 +326,21 @@ func rmAll(t *testing.T, path ...string) {
 	err := os.RemoveAll(join(path...))
 	if err != nil {
 		t.Fatalf("rmAll(%q): %s", join(path...), err)
+	}
+	if shouldWait(path...) {
+		eventSeparator()
+	}
+}
+
+// cat
+func cat(t *testing.T, path ...string) {
+	t.Helper()
+	if len(path) < 1 {
+		t.Fatalf("cat: path must have at least one element: %s", path)
+	}
+	_, err := os.ReadFile(join(path...))
+	if err != nil {
+		t.Fatalf("cat(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -440,7 +456,11 @@ func (e Events) String() string {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(b, "%-20s %q", ee.Op.String(), filepath.ToSlash(ee.Name))
+		if ee.renamedFrom != "" {
+			fmt.Fprintf(b, "%-8s %s ← %s", ee.Op.String(), filepath.ToSlash(ee.Name), filepath.ToSlash(ee.renamedFrom))
+		} else {
+			fmt.Fprintf(b, "%-8s %s", ee.Op.String(), filepath.ToSlash(ee.Name))
+		}
 	}
 	return b.String()
 }
@@ -451,6 +471,11 @@ func (e Events) TrimPrefix(prefix string) Events {
 			e[i].Name = "/"
 		} else {
 			e[i].Name = strings.TrimPrefix(e[i].Name, prefix)
+		}
+		if e[i].renamedFrom == prefix {
+			e[i].renamedFrom = "/"
+		} else {
+			e[i].renamedFrom = strings.TrimPrefix(e[i].renamedFrom, prefix)
 		}
 	}
 	return e
@@ -507,44 +532,55 @@ func newEvents(t *testing.T, s string) Events {
 		}
 
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			if strings.ToUpper(fields[0]) == "EMPTY" || strings.ToLower(fields[0]) == "no-events" {
+		if len(fields) != 2 && len(fields) != 4 {
+			if strings.ToLower(fields[0]) == "empty" || strings.ToLower(fields[0]) == "no-events" {
 				for _, g := range groups {
 					events[g] = Events{}
 				}
 				continue
 			}
-
-			t.Fatalf("newEvents: line %d has less than 2 fields: %s", no, line)
+			t.Fatalf("newEvents: line %d: needs 2 or 4 fields: %s", no+1, line)
 		}
 
-		path := strings.Trim(fields[len(fields)-1], `"`)
-
 		var op Op
-		for _, e := range fields[:len(fields)-1] {
-			if e == "|" {
-				continue
+		for _, ee := range strings.Split(fields[0], "|") {
+			switch strings.ToUpper(ee) {
+			case "CREATE":
+				op |= Create
+			case "WRITE":
+				op |= Write
+			case "REMOVE":
+				op |= Remove
+			case "RENAME":
+				op |= Rename
+			case "CHMOD":
+				op |= Chmod
+			case "OPEN":
+				op |= xUnportableOpen
+			case "READ":
+				op |= xUnportableRead
+			case "CLOSE_WRITE":
+				op |= xUnportableCloseWrite
+			case "CLOSE_READ":
+				op |= xUnportableCloseRead
+			default:
+				t.Fatalf("newEvents: line %d has unknown event %q: %s", no+1, ee, line)
 			}
-			for _, ee := range strings.Split(e, "|") {
-				switch strings.ToUpper(ee) {
-				case "CREATE":
-					op |= Create
-				case "WRITE":
-					op |= Write
-				case "REMOVE":
-					op |= Remove
-				case "RENAME":
-					op |= Rename
-				case "CHMOD":
-					op |= Chmod
-				default:
-					t.Fatalf("newEvents: line %d has unknown event %q: %s", no, ee, line)
-				}
+		}
+
+		var from string
+		if len(fields) > 2 {
+			if fields[2] != "←" {
+				t.Fatalf("newEvents: line %d: invalid format: %s", no+1, line)
 			}
+			from = strings.Trim(fields[3], `"`)
+		}
+		if !supportsRename() {
+			from = ""
 		}
 
 		for _, g := range groups {
-			events[g] = append(events[g], Event{Name: path, Op: op})
+			events[g] = append(events[g], Event{Name: strings.Trim(fields[1], `"`), renamedFrom: from, Op: op})
 		}
 	}
 
@@ -580,8 +616,9 @@ func cmpEvents(t *testing.T, tmp string, have, want Events) {
 	})
 
 	if haveSort.String() != wantSort.String() {
-		//t.Error("\n" + ztest.Diff(indent(haveSort), indent(wantSort)))
-		t.Errorf("\nhave:\n%s\nwant:\n%s", indent(have), indent(want))
+		b := new(strings.Builder)
+		b.WriteString(strings.TrimSpace(ztest.Diff(indent(haveSort), indent(wantSort))))
+		t.Errorf("\nhave:\n%s\nwant:\n%s\ndiff:\n%s", indent(have), indent(want), indent(b))
 	}
 }
 
@@ -590,11 +627,6 @@ func indent(s fmt.Stringer) string {
 }
 
 var join = filepath.Join
-
-func isCI() bool {
-	_, ok := os.LookupEnv("CI")
-	return ok
-}
 
 func isKqueue() bool {
 	switch runtime.GOOS {
@@ -612,12 +644,39 @@ func isSolaris() bool {
 	return false
 }
 
-func recurseOnly(t *testing.T) {
+func supportsRecurse(t *testing.T) {
 	switch runtime.GOOS {
-	//case "windows":
-	// Run test.
+	case "windows", "linux":
+		// Run test.
 	default:
 		t.Skip("recursion not yet supported on " + runtime.GOOS)
+	}
+}
+
+func supportsFilter(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux":
+		// Run test.
+	default:
+		t.Skip("withOps() not yet supported on " + runtime.GOOS)
+	}
+}
+
+func supportsRename() bool {
+	switch runtime.GOOS {
+	case "linux", "windows":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportsNofollow(t *testing.T) {
+	switch runtime.GOOS {
+	case "linux":
+		// Run test.
+	default:
+		t.Skip("withNoFollow() not yet supported on " + runtime.GOOS)
 	}
 }
 
@@ -709,6 +768,7 @@ func parseScript(t *testing.T, in string) {
 			}
 		}
 	)
+loop:
 	for _, c := range cmds {
 		c := c
 		//fmt.Printf("line %d: %q  %q\n", c.line, c.cmd, c.args)
@@ -716,6 +776,28 @@ func parseScript(t *testing.T, in string) {
 		case "skip", "require":
 			mustArg(c, 1)
 			switch c.args[0] {
+			case "op_all":
+				if runtime.GOOS != "linux" {
+					t.Skip("No op_all on this platform")
+				}
+			case "op_open":
+				if runtime.GOOS != "linux" {
+					t.Skip("No Open on this platform")
+				}
+			case "op_read":
+				if runtime.GOOS != "linux" {
+					t.Skip("No Read on this platform")
+				}
+			case "op_close_write":
+				if runtime.GOOS != "linux" {
+					t.Skip("No CloseWrite on this platform")
+				}
+			case "op_close_read":
+				if runtime.GOOS != "linux" {
+					t.Skip("No CloseRead on this platform")
+				}
+			case "always":
+				t.Skip()
 			case "symlink":
 				if !internal.HasPrivilegesForSymlink() {
 					t.Skipf("%s symlink: admin permissions required on Windows", c.cmd)
@@ -724,8 +806,6 @@ func parseScript(t *testing.T, in string) {
 				if runtime.GOOS == "windows" {
 					t.Skip("No named pipes on Windows")
 				}
-			case "recurse":
-				recurseOnly(t)
 			case "mknod":
 				if runtime.GOOS == "windows" {
 					t.Skip("No device nodes on Windows")
@@ -739,6 +819,12 @@ func parseScript(t *testing.T, in string) {
 				if isSolaris() {
 					t.Skip(`"mknod fails with "not owner"`)
 				}
+			case "recurse":
+				supportsRecurse(t)
+			case "filter":
+				supportsFilter(t)
+			case "nofollow":
+				supportsNofollow(t)
 			case "windows":
 				if runtime.GOOS == "windows" {
 					t.Skip("Skipping on Windows")
@@ -747,12 +833,97 @@ func parseScript(t *testing.T, in string) {
 				if runtime.GOOS == "netbsd" {
 					t.Skip("Skipping on NetBSD")
 				}
+			case "openbsd":
+				if runtime.GOOS == "openbsd" {
+					t.Skip("Skipping on OpenBSD")
+				}
 			default:
 				t.Fatalf("line %d: unknown %s reason: %q", c.line, c.cmd, c.args[0])
 			}
-		case "watch":
+		//case "state":
+		//	mustArg(c, 0)
+		//	do = append(do, func() { eventSeparator(); fmt.Fprintln(os.Stderr); w.w.state(); fmt.Fprintln(os.Stderr) })
+		case "debug":
 			mustArg(c, 1)
-			do = append(do, func() { addWatch(t, w.w, tmppath(tmp, c.args[0])) })
+			switch c.args[0] {
+			case "1", "on", "true", "yes":
+				do = append(do, func() { debug = true })
+			case "0", "off", "false", "no":
+				do = append(do, func() { debug = false })
+			default:
+				t.Fatalf("line %d: unknown debug: %q", c.line, c.args[0])
+			}
+		case "stop":
+			mustArg(c, 0)
+			break loop
+		case "watch":
+			if len(c.args) < 1 {
+				t.Fatalf("line %d: %q requires at least %d arguments (have %d: %q)",
+					c.line, c.cmd, 1, len(c.args), c.args)
+			}
+			if len(c.args) == 1 {
+				do = append(do, func() { addWatch(t, w.w, tmppath(tmp, c.args[0])) })
+				continue
+			}
+
+			var follow addOpt
+			for i := range c.args {
+				if c.args[i] == "nofollow" || c.args[i] == "no-follow" {
+					c.args = append(c.args[:i], c.args[i+1:]...)
+					follow = withNoFollow()
+					break
+				}
+			}
+
+			var op Op
+			for _, o := range c.args[1:] {
+				switch strings.ToLower(o) {
+				default:
+					t.Fatalf("line %d: unknown: %q", c.line+1, o)
+				case "default":
+					op |= Create | Write | Remove | Rename | Chmod
+				case "create":
+					op |= Create
+				case "write":
+					op |= Write
+				case "remove":
+					op |= Remove
+				case "rename":
+					op |= Rename
+				case "chmod":
+					op |= Chmod
+				case "open":
+					op |= xUnportableOpen
+				case "read":
+					op |= xUnportableRead
+				case "close_write":
+					op |= xUnportableCloseWrite
+				case "close_read":
+					op |= xUnportableCloseRead
+				}
+			}
+			do = append(do, func() {
+				p := tmppath(tmp, c.args[0])
+				err := w.w.AddWith(p, withOps(op), follow)
+				if err != nil {
+					t.Fatalf("line %d: addWatch(%q): %s", c.line+1, p, err)
+				}
+			})
+		case "unwatch":
+			mustArg(c, 1)
+			do = append(do, func() { rmWatch(t, w.w, tmppath(tmp, c.args[0])) })
+		case "watchlist":
+			mustArg(c, 1)
+			n, err := strconv.ParseInt(c.args[0], 10, 0)
+			if err != nil {
+				t.Fatalf("line %d: %s", c.line, err)
+			}
+			do = append(do, func() {
+				wl := w.w.WatchList()
+				if l := int64(len(wl)); l != n {
+					t.Errorf("line %d: watchlist has %d entries, not %d\n%q", c.line, l, n, wl)
+				}
+			})
 		case "touch":
 			mustArg(c, 1)
 			do = append(do, func() { touch(t, tmppath(tmp, c.args[0])) })
@@ -804,6 +975,9 @@ func parseScript(t *testing.T, in string) {
 				t.Fatalf("line %d: %s", c.line, err)
 			}
 			do = append(do, func() { chmod(t, fs.FileMode(n), tmppath(tmp, c.args[1])) })
+		case "cat":
+			mustArg(c, 1)
+			do = append(do, func() { cat(t, tmppath(tmp, c.args[0])) })
 		case "echo":
 			if len(c.args) < 2 || len(c.args) > 3 {
 				t.Fatalf("line %d: %q requires 2 or 3 arguments (have %d: %q)",

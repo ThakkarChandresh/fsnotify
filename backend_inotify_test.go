@@ -27,11 +27,17 @@ func TestRemoveState(t *testing.T) {
 
 	check := func(want int) {
 		t.Helper()
-		if w.watches.len() != want {
-			t.Error(w.watches)
+		if w.b.(*inotify).watches.len() != want {
+			t.Error(w.b.(*inotify).watches)
 		}
 	}
 
+	check(2)
+
+	// Shouldn't change internal state.
+	if err := w.Add("/path-doesnt-exist"); err == nil {
+		t.Fatal(err)
+	}
 	check(2)
 
 	if err := w.Remove(file); err != nil {

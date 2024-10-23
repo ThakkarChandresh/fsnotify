@@ -26,17 +26,14 @@ import (
 // https://go-review.googlesource.com/c/go/+/393354/
 func init() {
 	internal.SetRlimit()
+	enableRecurse = true
 }
 
 func TestScript(t *testing.T) {
 	err := filepath.Walk("./testdata", func(path string, info fs.FileInfo, err error) error {
-		if err != nil {
+		if err != nil || info.IsDir() {
 			return err
 		}
-		if info.IsDir() {
-			return nil
-		}
-		//t.Run(filepath.ToSlash(path), func(t *testing.T) {
 		n := strings.Split(filepath.ToSlash(path), "/")
 		t.Run(strings.Join(n[1:], "/"), func(t *testing.T) {
 			t.Parallel()
@@ -598,7 +595,7 @@ func TestRemove(t *testing.T) {
 	})
 
 	t.Run("remove with ... when non-recursive", func(t *testing.T) {
-		recurseOnly(t)
+		supportsRecurse(t)
 		t.Parallel()
 
 		tmp := t.TempDir()
@@ -620,15 +617,15 @@ func TestEventString(t *testing.T) {
 		want string
 	}{
 		{Event{}, `[no events]   ""`},
-		{Event{"/file", 0}, `[no events]   "/file"`},
+		{Event{Name: "/file", Op: 0}, `[no events]   "/file"`},
 
-		{Event{"/file", Chmod | Create},
+		{Event{Name: "/file", Op: Chmod | Create},
 			`CREATE|CHMOD  "/file"`},
-		{Event{"/file", Rename},
+		{Event{Name: "/file", Op: Rename},
 			`RENAME        "/file"`},
-		{Event{"/file", Remove},
+		{Event{Name: "/file", Op: Remove},
 			`REMOVE        "/file"`},
-		{Event{"/file", Write | Chmod},
+		{Event{Name: "/file", Op: Write | Chmod},
 			`WRITE|CHMOD   "/file"`},
 	}
 
